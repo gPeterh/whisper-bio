@@ -52,12 +52,19 @@ pip install -r requirements_p6000.txt
 
 The training code expects WALTZ Arrow shards with audio and WBD label columns.
 
-Default paths used by the scripts:
+Default paths used by the scripts (nano5):
 
 ```text
 /work/peter065/WALTZ_storage/waltz_datasets/train
 /work/peter065/WALTZ_storage/waltz_datasets/dev
 /work/peter065/WALTZ_storage/waltz_datasets/test
+```
+
+For dicos.grid
+```text
+/ceph/work/KLP/peter1/WALTZ_storage/waltz_datasets/train
+/ceph/work/KLP/peter1/WALTZ_storage/waltz_datasets/dev
+/ceph/work/KLP/peter1/WALTZ_storage/waltz_datasets/test
 ```
 
 Required label columns:
@@ -166,20 +173,4 @@ boundary_ref
 
 The best model is selected by `segmentation_r_value`.
 
-## Notes
 
-Generated files are intentionally ignored by Git:
-
-```text
-__pycache__/
-*.pyc
-*.pt
-*.pth
-checkpoint/
-wandb/
-*.out
-*.err
-*.log
-```
-
-Large datasets, checkpoints, W&B logs, and SLURM logs should stay outside the GitHub repository.
