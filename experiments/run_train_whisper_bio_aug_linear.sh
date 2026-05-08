@@ -106,7 +106,7 @@ python -u /work/peter065/Word-Segmenter/whisper-bio/train_whisper_wbd.py \
   --boundary-tolerance 2 \
   --frame-selection mid \
   --shuffle-buffer 2048 \
-  --log-every 500 \
+  --log-every 200 \
   --checkpoint-dir "${CHECKPOINT_DIR}" \
   "${RESUME_ARG[@]}" \
   "${WANDB_ARG[@]}"
