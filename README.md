@@ -4,6 +4,10 @@ This project trains a lightweight BIO frame classifier on top of frozen Whisper 
 
 The input data is stored as WALTZ Arrow shards. Each row contains audio bytes and WhisperX word-level time alignment. The label preprocessing step converts the word time spans into BIO labels on the Whisper encoder time grid.
 
+## TODO
+1. [ ] Add casual mask on whisper encoder
+2. [ ] Add inference code
+
 ## Project Layout
 
 ```text
