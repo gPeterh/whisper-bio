@@ -150,15 +150,9 @@ def write_arrow_stream(table: pa.Table, path: Path) -> None:
 
 
 def flatten_words(wx: Any) -> list[dict[str, Any]]:
-    if not wx:
+    if not isinstance(wx, list):
         return []
-    words = wx.get("word_segments") or []
-    if words:
-        return words
-    flattened = []
-    for segment in wx.get("segments") or []:
-        flattened.extend(segment.get("words") or [])
-    return flattened
+    return [word for word in wx if isinstance(word, dict)]
 
 
 def build_bio(
