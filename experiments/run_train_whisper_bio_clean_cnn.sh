@@ -26,28 +26,31 @@ nvidia-smi
 
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
-export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-12}"
-export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-12}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 
 TRAIN_DIR="${TRAIN_DIR:-/ceph/work/KLP/peter1/WALTZ_storage/waltz_datasets/train}"
 VAL_DIR="${VAL_DIR:-/ceph/work/KLP/peter1/WALTZ_storage/waltz_datasets/dev}"
 LABEL_COL="${LABEL_COL:-wbd_labels}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-/ceph/work/KLP/peter1/whisper-bio/checkpoints/whisper_bio_clean_causal_conv1d}"
-RUN_NAME="${RUN_NAME:-whisper-bio-clean-causal_conv1d}"
+CAUSAL_ENCODER="${CAUSAL_ENCODER:-0}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-/ceph/work/KLP/peter1/whisper-bio/checkpoints/whisper_bio_clean_cnn}"
+RUN_NAME="${RUN_NAME:-whisper_bio_clean_cnn}"
 
 BATCH_SIZE="${BATCH_SIZE:-32}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-2}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
-EPOCHS="${EPOCHS:-3}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-6}"
+SHUFFLE_BUFFER="${SHUFFLE_BUFFER:-1000}"
+EPOCHS="${EPOCHS:-1}"
 VAL_EVERY_STEPS="${VAL_EVERY_STEPS:-8000}"
 STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-0}"
 VAL_STEPS="${VAL_STEPS:-0}"
 LR="${LR:-1e-3}"
 HEAD_TYPE="${HEAD_TYPE:-causal_conv1d}"
-RESUME_ARG=()
-if [[ -n "${RESUME:-}" && "${RESUME}" != "0" ]]; then
-  RESUME_ARG=(--resume "${RESUME}")
+CAUSAL_ENCODER_ARG=()
+if [[ "${CAUSAL_ENCODER}" == "1" || "${CAUSAL_ENCODER}" == "true" || "${CAUSAL_ENCODER}" == "TRUE" ]]; then
+  CAUSAL_ENCODER_ARG=(--causal-encoder)
 fi
 
 mkdir -p "${CHECKPOINT_DIR}"
@@ -58,8 +61,12 @@ echo "train_dir=${TRAIN_DIR}"
 echo "val_dir=${VAL_DIR}"
 echo "label_col=${LABEL_COL}"
 echo "head_type=${HEAD_TYPE}"
+echo "causal_encoder=${CAUSAL_ENCODER}"
 echo "checkpoint_dir=${CHECKPOINT_DIR}"
 echo "steps_per_epoch=${STEPS_PER_EPOCH} val_steps=${VAL_STEPS} val_every_steps=${VAL_EVERY_STEPS}"
+echo "batch_size=${BATCH_SIZE}"
+echo "num_workers=${NUM_WORKERS} prefetch_factor=${PREFETCH_FACTOR} shuffle_buffer=${SHUFFLE_BUFFER}"
+echo "OMP_NUM_THREADS=${OMP_NUM_THREADS} MKL_NUM_THREADS=${MKL_NUM_THREADS}"
 
 
 python - <<'PY'
@@ -103,6 +110,7 @@ python -u /ceph/work/KLP/peter1/whisper-bio/train_whisper_wbd.py \
   --batch-size "${BATCH_SIZE}" \
   --grad-accum-steps "${GRAD_ACCUM_STEPS}" \
   --num-workers "${NUM_WORKERS}" \
+  --prefetch-factor "${PREFETCH_FACTOR}" \
   --epochs "${EPOCHS}" \
   --val-every-steps "${VAL_EVERY_STEPS}" \
   --lr "${LR}" \
@@ -110,14 +118,15 @@ python -u /ceph/work/KLP/peter1/whisper-bio/train_whisper_wbd.py \
   --max-grad-norm 1.0 \
   --encoder-layer 6 \
   --freeze-encoder \
+  "${CAUSAL_ENCODER_ARG[@]}" \
   --head-type "${HEAD_TYPE}" \
   --dropout 0.1 \
   --boundary-tolerance 2 \
   --frame-selection none \
-  --shuffle-buffer 2048 \
+  --shuffle-buffer "${SHUFFLE_BUFFER}" \
+  --pin-memory \
   --log-every 200 \
   --checkpoint-dir "${CHECKPOINT_DIR}" \
-  "${RESUME_ARG[@]}" \
   "${WANDB_ARG[@]}"
 
 echo "[$(date --iso-8601=seconds)] training finished"

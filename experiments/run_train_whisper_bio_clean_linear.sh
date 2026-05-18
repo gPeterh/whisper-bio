@@ -1,18 +1,27 @@
 #!/bin/bash
-#SBATCH --account ACD114137
 #SBATCH --job-name=whisper-BIO
-#SBATCH --partition=normal
+#SBATCH --partition=reservation_b6000_2
+##SBATCH --partition=a100-al9
+##SBATCH --reservation=klp_reservation
+##SBATCH --qos=klp_a100_reservation
+#SBATCH --time=32-00:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=1
-#SBATCH --cpus-per-task=12
-#SBATCH -o /work/peter065/Word-Segmenter/whisper_bio_slurm-logs/%j.out
-#SBATCH -e /work/peter065/Word-Segmenter/whisper_bio_slurm-logs/%j.err
+#SBATCH --cpus-per-task=16
+#SBATCH -o /ceph/work/KLP/peter1/whisper-bio/whisper_bio_slurm/%j.out
+#SBATCH -e /ceph/work/KLP/peter1/whisper-bio/whisper_bio_slurm/%j.err
 
 set -euo pipefail
 
-module load miniconda3
-conda activate wbd
+CONDA_ENV_NAME="wbd"
+conda env list
+module load anaconda3/2024.10-1
+eval "$(conda shell.bash hook)"
+conda activate "$CONDA_ENV_NAME"
+conda env list
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+nvidia-smi
 
 
 export PYTHONUNBUFFERED=1
@@ -21,26 +30,22 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-12}"
 export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-12}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 
-TRAIN_DIR="${TRAIN_DIR:-/work/peter065/WALTZ_storage/waltz_datasets/train}"
-VAL_DIR="${VAL_DIR:-/work/peter065/WALTZ_storage/waltz_datasets/dev}"
+TRAIN_DIR="${TRAIN_DIR:-/ceph/work/KLP/peter1/WALTZ_storage/waltz_datasets/train}"
+VAL_DIR="${VAL_DIR:-/ceph/work/KLP/peter1/WALTZ_storage/waltz_datasets/dev}"
 LABEL_COL="${LABEL_COL:-wbd_labels}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-/work/peter065/Word-Segmenter/checkpoint/whisper_bio_clean_linear_ce}"
-RUN_NAME="${RUN_NAME:-whisper-bio-clean-linear_ce}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-/ceph/work/KLP/peter1/whisper-bio/checkpoints/whisper_bio_clean_causal_conv1d}"
+RUN_NAME="${RUN_NAME:-whisper-bio-clean-linear}"
 
 BATCH_SIZE="${BATCH_SIZE:-32}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-2}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
-EPOCHS="${EPOCHS:-3}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-6}"
+EPOCHS="${EPOCHS:-1}"
 VAL_EVERY_STEPS="${VAL_EVERY_STEPS:-8000}"
 STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-0}"
 VAL_STEPS="${VAL_STEPS:-0}"
 LR="${LR:-1e-3}"
 HEAD_TYPE="${HEAD_TYPE:-linear}"
-RESUME_ARG=()
-if [[ -n "${RESUME:-}" && "${RESUME}" != "0" ]]; then
-  RESUME_ARG=(--resume "${RESUME}")
-fi
-
 mkdir -p "${CHECKPOINT_DIR}"
 
 echo "[$(date --iso-8601=seconds)] starting ${SLURM_JOB_NAME:-local} job_id=${SLURM_JOB_ID:-none}"
@@ -86,7 +91,7 @@ if [[ "${USE_WANDB:-1}" == "1" ]]; then
   )
 fi
 
-python -u /work/peter065/Word-Segmenter/whisper-bio/train_whisper_wbd.py \
+python -u /ceph/work/KLP/peter1/whisper-bio/train_whisper_wbd.py \
   --train-dir "${TRAIN_DIR}" \
   --val-dir "${VAL_DIR}" \
   --label-col "${LABEL_COL}" \
@@ -94,6 +99,7 @@ python -u /work/peter065/Word-Segmenter/whisper-bio/train_whisper_wbd.py \
   --batch-size "${BATCH_SIZE}" \
   --grad-accum-steps "${GRAD_ACCUM_STEPS}" \
   --num-workers "${NUM_WORKERS}" \
+  --prefetch-factor "${PREFETCH_FACTOR}" \
   --epochs "${EPOCHS}" \
   --val-every-steps "${VAL_EVERY_STEPS}" \
   --lr "${LR}" \
@@ -105,10 +111,9 @@ python -u /work/peter065/Word-Segmenter/whisper-bio/train_whisper_wbd.py \
   --dropout 0.1 \
   --boundary-tolerance 2 \
   --frame-selection none \
-  --shuffle-buffer 2048 \
+  --shuffle-buffer 1000 \
   --log-every 200 \
   --checkpoint-dir "${CHECKPOINT_DIR}" \
-  "${RESUME_ARG[@]}" \
   "${WANDB_ARG[@]}"
 
 echo "[$(date --iso-8601=seconds)] training finished"
