@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import random
-from collections import deque
 from io import BytesIO
 from pathlib import Path
 from typing import Iterable
@@ -54,7 +53,8 @@ def decode_audio(mp3_field: dict) -> tuple[torch.Tensor, int]:
     audio_bytes = mp3_field.get("bytes")
     if not audio_bytes:
         raise ValueError("mp3.bytes is empty")
-    waveform, sample_rate = torchaudio.load(BytesIO(audio_bytes))
+    with BytesIO(audio_bytes) as audio_file:
+        waveform, sample_rate = torchaudio.load(audio_file)
     if waveform.dim() == 2:
         waveform = waveform.mean(dim=0)
     waveform = waveform.to(torch.float32)
@@ -70,13 +70,42 @@ def decode_audio(mp3_field: dict) -> tuple[torch.Tensor, int]:
     return waveform.contiguous(), sample_rate
 
 
-def iter_arrow_rows(path: str) -> Iterable[dict]:
+def iter_arrow_raw_examples(
+    path: str,
+    *,
+    label_col: str,
+    label_len_col: str,
+    max_tokens: int,
+    max_rows_per_shard: int | None,
+) -> Iterable[dict]:
     with pa.memory_map(path, "r") as source:
         reader = ipc.open_stream(source)
+        row_count = 0
         for batch in reader:
-            table = pa.Table.from_batches([batch])
-            for row in table.to_pylist():
-                yield row
+            column_names = batch.schema.names
+            if "mp3" not in column_names or label_col not in column_names or label_len_col not in column_names:
+                continue
+            key_column = batch.column(column_names.index("__key__")) if "__key__" in column_names else None
+            mp3_column = batch.column(column_names.index("mp3"))
+            labels_column = batch.column(column_names.index(label_col))
+            label_len_column = batch.column(column_names.index(label_len_col))
+            for idx in range(batch.num_rows):
+                if max_rows_per_shard is not None and row_count >= max_rows_per_shard:
+                    return
+                row_count += 1
+                labels = labels_column[idx].as_py()
+                if labels is None:
+                    continue
+                label_len = int(label_len_column[idx].as_py())
+                label_len = max(0, min(label_len, max_tokens, len(labels)))
+                if label_len <= 0:
+                    continue
+                yield {
+                    "key": key_column[idx].as_py() if key_column is not None else "",
+                    "mp3": mp3_column[idx].as_py(),
+                    "labels": labels,
+                    "label_len": label_len,
+                }
 
 
 class WaltzArrowWBDDataset(IterableDataset):
@@ -117,57 +146,61 @@ class WaltzArrowWBDDataset(IterableDataset):
             random.Random(seed).shuffle(files)
         return files
 
-    def _iter_examples(self) -> Iterable[dict]:
+    def _iter_raw_examples(self) -> Iterable[dict]:
         for path in self._worker_files():
-            row_count = 0
-            for row in iter_arrow_rows(path):
-                if self.max_rows_per_shard is not None and row_count >= self.max_rows_per_shard:
-                    break
-                row_count += 1
-                if self.label_col not in row or self.label_len_col not in row:
-                    continue
-                labels = row[self.label_col]
-                if labels is None:
-                    continue
-                label_len = int(row[self.label_len_col])
-                label_len = max(0, min(label_len, self.max_tokens, len(labels)))
-                try:
-                    waveform, sample_rate = decode_audio(row["mp3"])
-                except Exception as exc:
-                    key = row.get("__key__", "<unknown>")
-                    print(f"[warn] skip {key}: audio decode failed: {exc}", flush=True)
-                    continue
-                labels = torch.tensor(labels[: self.max_tokens], dtype=torch.long)
-                if labels.numel() < self.max_tokens:
-                    labels = F.pad(labels, (0, self.max_tokens - labels.numel()), value=IGNORE_ID)
-                labels[label_len:] = IGNORE_ID
-                yield {
-                    "key": row.get("__key__", ""),
-                    "waveform": waveform,
-                    "sample_rate": sample_rate,
-                    "labels": labels,
-                    "label_len": label_len,
-                }
+            yield from iter_arrow_raw_examples(
+                path,
+                label_col=self.label_col,
+                label_len_col=self.label_len_col,
+                max_tokens=self.max_tokens,
+                max_rows_per_shard=self.max_rows_per_shard,
+            )
+
+    def _shuffle_raw_examples(self, raw_examples: Iterable[dict]) -> Iterable[dict]:
+        rng = random.Random(self.seed + self.epoch * 100_003)
+        buffer = []
+        for example in raw_examples:
+            if len(buffer) < self.shuffle_buffer:
+                buffer.append(example)
+                continue
+            idx = rng.randrange(self.shuffle_buffer)
+            yield buffer[idx]
+            buffer[idx] = example
+        rng.shuffle(buffer)
+        while buffer:
+            yield buffer.pop()
+
+    def _materialize_example(self, raw: dict) -> dict | None:
+        try:
+            waveform, sample_rate = decode_audio(raw["mp3"])
+        except Exception as exc:
+            key = raw.get("key", "<unknown>")
+            print(f"[warn] skip {key}: audio decode failed: {exc}", flush=True)
+            return None
+        label_len = raw["label_len"]
+        labels = torch.tensor(raw["labels"][: self.max_tokens], dtype=torch.long)
+        if labels.numel() < self.max_tokens:
+            labels = F.pad(labels, (0, self.max_tokens - labels.numel()), value=IGNORE_ID)
+        labels[label_len:] = IGNORE_ID
+        return {
+            "key": raw.get("key", ""),
+            "waveform": waveform,
+            "sample_rate": sample_rate,
+            "labels": labels,
+            "label_len": label_len,
+        }
+
+    def _iter_materialized_examples(self) -> Iterable[dict]:
+        raw_examples = self._iter_raw_examples()
+        if self.shuffle_buffer > 0:
+            raw_examples = self._shuffle_raw_examples(raw_examples)
+        for raw in raw_examples:
+            example = self._materialize_example(raw)
+            if example is not None:
+                yield example
 
     def __iter__(self) -> Iterable[dict]:
-        if self.shuffle_buffer <= 0:
-            yield from self._iter_examples()
-            return
-
-        rng = random.Random(self.seed + self.epoch * 100_003)
-        buffer: deque[dict] = deque()
-        for example in self._iter_examples():
-            buffer.append(example)
-            if len(buffer) >= self.shuffle_buffer:
-                idx = rng.randrange(len(buffer))
-                buffer.rotate(-idx)
-                yield buffer.popleft()
-                buffer.rotate(idx)
-        while buffer:
-            idx = rng.randrange(len(buffer))
-            buffer.rotate(-idx)
-            yield buffer.popleft()
-            buffer.rotate(idx)
+        yield from self._iter_materialized_examples()
 
 
 class WhisperCollator:

@@ -26,6 +26,7 @@ def save_checkpoint(
     path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         "classifier": model.classifier.state_dict(),
+        "model_trainable": model.trainable_state_dict(),
         "optimizer": optimizer.state_dict(),
         "args": vars(args),
         "epoch": epoch,
@@ -35,6 +36,8 @@ def save_checkpoint(
         "val_files": val_files,
         "model_name_or_path": args.model_name_or_path,
         "encoder_layer": args.encoder_layer,
+        "encoder_layers": args.encoder_layers,
+        "layer_fusion": model.layer_fusion,
         "freeze_encoder": args.freeze_encoder,
     }
     if args.save_full_model:

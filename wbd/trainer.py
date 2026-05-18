@@ -131,17 +131,16 @@ def run_epoch(
 
                 lr = optimizer.param_groups[0]["lr"]
                 grad_norm_value = float(grad_norm.item()) if torch.is_tensor(grad_norm) else grad_norm
-                wandb.log(
-                    {
-                        "global_step": global_step,
-                        "train/epoch": epoch,
-                        "train/lr": lr,
-                        "train/grad_norm": grad_norm_value,
-                        "train/loss_step": real_loss,
-                        "train/token_acc_step": batch_metrics.token_acc,
-                        "train/len": batch_metrics.len,
-                    }
-                )
+                log_values = {
+                    "global_step": global_step,
+                    "train/epoch": epoch,
+                    "train/lr": lr,
+                    "train/grad_norm": grad_norm_value,
+                    "train/loss_step": real_loss,
+                    "train/token_acc_step": batch_metrics.token_acc,
+                    "train/len": batch_metrics.len,
+                }
+                wandb.log(log_values)
         pbar.update(1)
         step += 1
 

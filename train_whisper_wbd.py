@@ -62,7 +62,18 @@ def parse_args() -> argparse.Namespace:
         default=6,
         help="Hidden-state index to use. 6 means after the first 6 encoder blocks; 0 is conv+pos embedding.",
     )
+    parser.add_argument(
+        "--encoder-layers",
+        default=None,
+        help="Comma-separated hidden-state indices. Multiple layers automatically use learnable weighted sum; use 'all' for all encoder layers.",
+    )
     parser.add_argument("--attn-implementation", default="sdpa", choices=[None, "eager", "sdpa", "flash_attention_2"])
+    parser.add_argument(
+        "--causal-encoder",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Apply a causal self-attention mask inside the Whisper encoder layers.",
+    )
     parser.add_argument("--freeze-encoder", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--head-type",
@@ -78,6 +89,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor when --num-workers > 0.")
+    parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--steps-per-epoch", type=int, default=0, help="Training batches per epoch. 0 means run through all resolved training shards.")
     parser.add_argument("--val-steps", type=int, default=0, help="Validation batches per epoch. 0 means run through all validation shards; negative disables validation.")
@@ -144,13 +157,15 @@ def make_loader(
         seed=seed,
         shuffle_files=shuffle_files,
     )
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        collate_fn=collator,
-    )
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "pin_memory": device.type == "cuda" if args.pin_memory is None else args.pin_memory,
+        "collate_fn": collator,
+    }
+    if args.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
+    loader = DataLoader(dataset, **loader_kwargs)
     return dataset, loader
 
 
@@ -176,7 +191,13 @@ def main() -> None:
     print(f"train shards: {len(train_files)}")
     print(f"val shards: {len(val_files)}")
     print(f"label column: {args.label_col}")
-    print(f"model: {args.model_name_or_path}, encoder hidden layer: {args.encoder_layer}")
+    if args.encoder_layers:
+        print(
+            f"model: {args.model_name_or_path}, encoder hidden layers: {args.encoder_layers}, "
+            "layer_fusion: auto"
+        )
+    else:
+        print(f"model: {args.model_name_or_path}, encoder hidden layer: {args.encoder_layer}")
     wandb_run = init_wandb(args, train_files, val_files)
 
     device = torch.device(args.device)
@@ -213,6 +234,8 @@ def main() -> None:
         head_type=args.head_type,
         dropout=args.dropout,
         attn_implementation=args.attn_implementation,
+        causal_encoder=args.causal_encoder,
+        encoder_layers=args.encoder_layers,
     ).to(device)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -233,6 +256,14 @@ def main() -> None:
         ckpt = torch.load(args.resume, map_location="cpu")
         if "model" in ckpt:
             model.load_state_dict(ckpt["model"])
+        elif "model_trainable" in ckpt:
+            missing, unexpected = model.load_state_dict(ckpt["model_trainable"], strict=False)
+            non_encoder_missing = [key for key in missing if not key.startswith("encoder.")]
+            if unexpected or non_encoder_missing:
+                raise ValueError(
+                    f"Checkpoint {args.resume} did not match model. "
+                    f"missing={non_encoder_missing}, unexpected={unexpected}"
+                )
         elif "classifier" in ckpt:
             model.classifier.load_state_dict(ckpt["classifier"])
         else:
