@@ -14,13 +14,9 @@
 
 set -euo pipefail
 
-CONDA_ENV_NAME="wbd"
-conda env list
-module load anaconda3/2024.10-1
-eval "$(conda shell.bash hook)"
-conda activate "$CONDA_ENV_NAME"
-conda env list
-export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+PROJECT_ROOT="${PROJECT_ROOT:-/ceph/work/KLP/peter1/whisper-bio}"
+source "${PROJECT_ROOT}/.venv/bin/activate"
+export LD_LIBRARY_PATH="${VIRTUAL_ENV}/lib:${LD_LIBRARY_PATH:-}"
 nvidia-smi
 
 
@@ -33,14 +29,14 @@ export WANDB_MODE="${WANDB_MODE:-online}"
 TRAIN_DIR="${TRAIN_DIR:-/ceph/work/KLP/peter1/WALTZ_storage/waltz_datasets/train}"
 VAL_DIR="${VAL_DIR:-/ceph/work/KLP/peter1/WALTZ_storage/waltz_datasets/dev}"
 LABEL_COL="${LABEL_COL:-wbd_labels}"
-CAUSAL_ENCODER="${CAUSAL_ENCODER:-0}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-/ceph/work/KLP/peter1/whisper-bio/checkpoints/whisper_bio_clean_cnn}"
-RUN_NAME="${RUN_NAME:-whisper_bio_clean_cnn}"
+CAUSAL_ENCODER="${CAUSAL_ENCODER:-1}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-/ceph/work/KLP/peter1/whisper-bio/checkpoints/whisper_bio_clean_causal_conv1d_causal_encoder_CWeight}"
+RUN_NAME="${RUN_NAME:-whisper_bio_clean_cnn_casual_encoder_CWeight}"
 
 BATCH_SIZE="${BATCH_SIZE:-32}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-2}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
-PREFETCH_FACTOR="${PREFETCH_FACTOR:-6}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-8}"
 SHUFFLE_BUFFER="${SHUFFLE_BUFFER:-1000}"
 EPOCHS="${EPOCHS:-1}"
 VAL_EVERY_STEPS="${VAL_EVERY_STEPS:-8000}"
@@ -74,12 +70,12 @@ import importlib.util
 import os
 import sys
 
-required = ["torch", "torchaudio", "pyarrow", "transformers"]
+required = ["torch", "pyarrow", "scipy", "soundfile", "transformers"]
 if os.environ.get("USE_WANDB", "1") == "1":
     required.append("wandb")
 missing = [name for name in required if importlib.util.find_spec(name) is None]
 if missing:
-    sys.exit("Missing Python packages: " + ", ".join(missing) + ". Run: pip install -r requirements_h100.txt or requirements_p6000.txt")
+    sys.exit("Missing Python packages: " + ", ".join(missing) + ". Run: uv sync --no-default-groups")
 
 import torch
 
@@ -102,11 +98,12 @@ if [[ "${USE_WANDB:-1}" == "1" ]]; then
   )
 fi
 
-python -u /ceph/work/KLP/peter1/whisper-bio/train_whisper_wbd.py \
+python -u "${PROJECT_ROOT}/train_whisper_wbd.py" \
   --train-dir "${TRAIN_DIR}" \
   --val-dir "${VAL_DIR}" \
   --label-col "${LABEL_COL}" \
   --loss ce \
+  --class-weights 1,3,1 \
   --batch-size "${BATCH_SIZE}" \
   --grad-accum-steps "${GRAD_ACCUM_STEPS}" \
   --num-workers "${NUM_WORKERS}" \
