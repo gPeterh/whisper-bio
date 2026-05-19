@@ -5,7 +5,7 @@ This project trains a lightweight BIO frame classifier on top of frozen Whisper 
 The input data is stored as WALTZ Arrow shards. Each row contains audio bytes and WhisperX word-level time alignment. The label preprocessing step converts the word time spans into BIO labels on the Whisper encoder time grid.
 
 ## TODO
-1. [ ] Add casual mask on whisper encoder
+1. [v] Add causal mask on whisper encoder
 2. [ ] Add inference code
 
 ## Project Layout
@@ -15,42 +15,57 @@ whisper-bio/
 ├── add_bio_label.py                         # Add BIO labels to Arrow shards
 ├── train_whisper_wbd.py                     # Training entry point
 ├── run_add_bio_label.sh                     # Example label-building SLURM script
-├── requirements_h100.txt                    # Python environment for H100 machine
-├── requirements_p6000.txt                   # Python environment for P6000 machine
-├── experiments/
+├── pyproject.toml                           
+├── requirements_h100.txt                    
+├── requirements_p6000.txt                   
+├── docs/
+├── tests/
+├── scripts/
 │   ├── run_train_whisper_bio_clean_linear.sh
 │   └── run_train_whisper_bio_aug_linear.sh
-└── wbd/
-    ├── checkpoint.py
-    ├── config.py
-    ├── data.py
-    ├── loss.py
-    ├── metrics.py
-    ├── model.py
-    ├── trainer.py
-    └── wandb_utils.py
+└── src/
+    └── wbd/
+        ├── checkpoint.py
+        ├── config.py
+        ├── data.py
+        ├── loss.py
+        ├── metrics.py
+        ├── model.py
+        ├── trainer.py
+        └── wandb_utils.py
 ```
 
 ## Environment
 
-Activate the existing conda environment:
+This project can run with either `uv` or the conda environment. The recommended project-managed setup is `uv`, which creates a `.venv/` from `pyproject.toml` and `uv.lock`.
 
 ```bash
-module load miniconda3
+export PATH="$HOME/.local/bin:$PATH"
+uv sync --no-default-groups
+source .venv/bin/activate
+```
+
+For development tools such as `pytest`, `ruff`, and `ipykernel`, include the dev group:
+
+```bash
+uv sync --group dev
+```
+
+Run project commands through uv:
+
+```bash
+uv run python train_whisper_wbd.py --help
+```
+
+Alternatively, activate the existing conda environment and install the legacy requirements file for the target machine:
+
+```bash
+module load anaconda3/2024.10-1
 conda activate wbd
-```
-
-Install dependencies for the target machine:
-
-```bash
-pip install -r requirements_h100.txt
-```
-
-or:
-
-```bash
 pip install -r requirements_p6000.txt
 ```
+
+The P6000 uv setup currently pins Python 3.10 and routes `torch` to the PyTorch CUDA 12.8 wheel index in `pyproject.toml`. The SLURM scripts under `scripts/` expect an existing `.venv` and activate it directly.
 
 ## Data
 
@@ -110,13 +125,13 @@ The labels are generated on the Whisper encoder frame grid, where one hidden-sta
 Clean-label baseline:
 
 ```bash
-sbatch experiments/run_train_whisper_bio_clean_linear.sh
+sbatch scripts/run_train_whisper_bio_clean_linear.sh
 ```
 
 Augmented-label experiment:
 
 ```bash
-sbatch experiments/run_train_whisper_bio_aug_linear.sh
+sbatch scripts/run_train_whisper_bio_aug_linear.sh
 ```
 
 Common environment overrides:
@@ -128,14 +143,14 @@ GRAD_ACCUM_STEPS=2 \
 LR=1e-3 \
 HEAD_TYPE=linear \
 CHECKPOINT_DIR=/path/to/checkpoints \
-sbatch experiments/run_train_whisper_bio_clean_linear.sh
+sbatch scripts/run_train_whisper_bio_clean_linear.sh
 ```
 
 Resume from a checkpoint:
 
 ```bash
 RESUME=/path/to/epoch_0_whole_resume.pt \
-sbatch experiments/run_train_whisper_bio_clean_linear.sh
+sbatch scripts/run_train_whisper_bio_clean_linear.sh
 ```
 
 Supported classifier heads:
@@ -176,5 +191,3 @@ boundary_ref
 ```
 
 The best model is selected by `segmentation_r_value`.
-
-

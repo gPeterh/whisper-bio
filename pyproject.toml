@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "whisper-bio"
+version = "0.1.0"
+description = "Whisper encoder BIO frame classifier for word boundary detection."
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "datasets==2.18.0",
+    "librosa==0.10.2",
+    "numpy==1.26.4",
+    "pandas==2.3.3",
+    "pyarrow-hotfix==0.7",
+    "pyarrow==24.0.0",
+    "scikit-learn==1.7.2",
+    "scipy==1.15.3",
+    "soundfile==0.12.1",
+    "torch==2.11.0",
+    "torchmetrics==1.9.0",
+    "tqdm==4.67.3",
+    "transformers==4.57.6",
+    "wandb==0.26.1",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel==7.2.0",
+    "pytest>=8.4,<9",
+    "ruff==0.15.12",
+]
+
+[tool.uv]
+default-groups = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wbd"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128", marker = "sys_platform == 'linux'" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
