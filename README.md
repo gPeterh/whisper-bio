@@ -12,14 +12,15 @@ The input data is stored as WALTZ Arrow shards. Each row contains audio bytes an
 
 ```text
 whisper-bio/
-├── add_bio_label.py                         # Add BIO labels to Arrow shards
 ├── train_whisper_wbd.py                     # Training entry point
-├── run_add_bio_label.sh                     # Example label-building SLURM script
-├── pyproject.toml                           
-├── requirements_h100.txt                    
-├── requirements_p6000.txt                   
+├── pyproject.toml
+├── requirements_h100.txt
+├── requirements_p6000.txt
 ├── docs/
 ├── tests/
+├── tasks/
+│   ├── add_bio_label.py                     # Add BIO labels to Arrow shards
+│   └── run_add_bio_label.sh                 # Example label-building SLURM script
 ├── scripts/
 │   ├── run_train_whisper_bio_clean_linear.sh
 │   └── run_train_whisper_bio_aug_linear.sh
@@ -109,7 +110,7 @@ Label ids:
 BIO labels can be added to Arrow files with:
 
 ```bash
-python add_bio_label.py \
+python tasks/add_bio_label.py \
   --input-dir /work/peter065/WALTZ_storage/waltz_datasets/train \
   --split train \
   --in-place \

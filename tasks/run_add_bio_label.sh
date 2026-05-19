@@ -11,12 +11,12 @@
 
 set -euo pipefail
 
-module load miniconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate wbd
+PROJECT_ROOT="${PROJECT_ROOT:-/ceph/work/KLP/peter1/whisper-bio}"
+source "${PROJECT_ROOT}/.venv/bin/activate"
+export LD_LIBRARY_PATH="${VIRTUAL_ENV}/lib:${LD_LIBRARY_PATH:-}"
 
 
-python /work/peter065/Word-Segmenter/whisper-bio/add_bio_label.py \
+python "${PROJECT_ROOT}/tasks/add_bio_label.py" \
   --input-dir /work/peter065/WALTZ_storage/waltz_datasets/test \
   --split test \
   --in-place \
