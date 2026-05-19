@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import math
 import random
 from io import BytesIO
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.ipc as ipc
+import soundfile as sf
 import torch
 import torch.nn.functional as F
-import torchaudio
+from scipy.signal import resample_poly
 from torch.utils.data import IterableDataset, get_worker_info
 from transformers import WhisperFeatureExtractor
 
@@ -54,13 +57,16 @@ def decode_audio(mp3_field: dict) -> tuple[torch.Tensor, int]:
     if not audio_bytes:
         raise ValueError("mp3.bytes is empty")
     with BytesIO(audio_bytes) as audio_file:
-        waveform, sample_rate = torchaudio.load(audio_file)
-    if waveform.dim() == 2:
-        waveform = waveform.mean(dim=0)
-    waveform = waveform.to(torch.float32)
+        audio, sample_rate = sf.read(audio_file, dtype="float32", always_2d=False)
+    if audio.ndim == 2:
+        audio = audio.mean(axis=1)
+    audio = np.ascontiguousarray(audio, dtype=np.float32)
     if sample_rate != SAMPLE_RATE:
-        waveform = torchaudio.functional.resample(waveform, sample_rate, SAMPLE_RATE)
+        divisor = math.gcd(sample_rate, SAMPLE_RATE)
+        audio = resample_poly(audio, SAMPLE_RATE // divisor, sample_rate // divisor)
+        audio = np.ascontiguousarray(audio, dtype=np.float32)
         sample_rate = SAMPLE_RATE
+    waveform = torch.from_numpy(audio)
     max_abs = waveform.abs().max()
     if max_abs > 1.0:
         waveform = waveform / max_abs
