@@ -12,6 +12,10 @@ import torch
 from .metrics import BatchMetrics
 
 
+def unwrap_model(model):
+    return getattr(model, "module", model)
+
+
 def save_checkpoint(
     path: Path,
     model,
@@ -24,9 +28,10 @@ def save_checkpoint(
     val_files: list[str],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    model_to_save = unwrap_model(model)
     checkpoint = {
-        "classifier": model.classifier.state_dict(),
-        "model_trainable": model.trainable_state_dict(),
+        "classifier": model_to_save.classifier.state_dict(),
+        "model_trainable": model_to_save.trainable_state_dict(),
         "optimizer": optimizer.state_dict(),
         "args": vars(args),
         "epoch": epoch,
@@ -37,11 +42,12 @@ def save_checkpoint(
         "model_name_or_path": args.model_name_or_path,
         "encoder_layer": args.encoder_layer,
         "encoder_layers": args.encoder_layers,
-        "layer_fusion": model.layer_fusion,
+        "encoder_lookahead_frames": args.encoder_lookahead_frames,
+        "layer_fusion": model_to_save.layer_fusion,
         "freeze_encoder": args.freeze_encoder,
     }
     if args.save_full_model:
-        checkpoint["model"] = model.state_dict()
+        checkpoint["model"] = model_to_save.state_dict()
     torch.save(checkpoint, path)
 
 

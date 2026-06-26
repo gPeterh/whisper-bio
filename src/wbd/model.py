@@ -13,8 +13,17 @@ from .config import NUM_CLASSES
 HEAD_HIDDEN_SIZE = 256
 CAUSAL_CONV_LAYERS = 3
 CAUSAL_CONV_KERNEL_SIZE = 3
+DYNAMIC_FUSION_HIDDEN_SIZE = 128
 LAYER_FUSION_SINGLE = "single"
 LAYER_FUSION_WEIGHTED_SUM = "learnable_weighted_sum"
+LAYER_FUSION_DYNAMIC_WEIGHTED_SUM = "dynamic_weighted_sum"
+LAYER_FUSION_AUTO = "auto"
+LAYER_FUSION_CHOICES = (
+    LAYER_FUSION_AUTO,
+    LAYER_FUSION_SINGLE,
+    LAYER_FUSION_WEIGHTED_SUM,
+    LAYER_FUSION_DYNAMIC_WEIGHTED_SUM,
+)
 
 
 class LinearBIOHead(nn.Module):
@@ -116,7 +125,9 @@ class WhisperWBDClassifier(nn.Module):
         dropout: float,
         attn_implementation: str | None,
         causal_encoder: bool = False,
+        encoder_lookahead_frames: int = 0,
         encoder_layers: str | list[int] | None = None,
+        layer_fusion: str | None = None,
     ):
         super().__init__()
         kwargs = {}
@@ -129,11 +140,22 @@ class WhisperWBDClassifier(nn.Module):
         self.freeze_encoder = freeze_encoder
         self.head_type = head_type
         self.causal_encoder = causal_encoder
-        self.layer_fusion = LAYER_FUSION_WEIGHTED_SUM if len(self.encoder_layers) > 1 else LAYER_FUSION_SINGLE
+        if encoder_lookahead_frames < 0:
+            raise ValueError("encoder_lookahead_frames must be >= 0.")
+        self.encoder_lookahead_frames = int(encoder_lookahead_frames)
+        self.layer_fusion = self._resolve_layer_fusion(layer_fusion)
         hidden_size = self.encoder.config.d_model
 
         if self.layer_fusion == LAYER_FUSION_WEIGHTED_SUM:
             self.layer_fusion_logits = nn.Parameter(torch.zeros(len(self.encoder_layers)))
+        elif self.layer_fusion == LAYER_FUSION_DYNAMIC_WEIGHTED_SUM:
+            self.layer_fusion_gate = nn.Sequential(
+                nn.LayerNorm(hidden_size),
+                nn.Linear(hidden_size, DYNAMIC_FUSION_HIDDEN_SIZE),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(DYNAMIC_FUSION_HIDDEN_SIZE, len(self.encoder_layers)),
+            )
 
         if freeze_encoder:
             self.encoder.eval()
@@ -141,6 +163,18 @@ class WhisperWBDClassifier(nn.Module):
                 param.requires_grad = False
 
         self.classifier = make_bio_head(head_type, hidden_size, dropout)
+
+    def _resolve_layer_fusion(self, layer_fusion: str | None) -> str:
+        if layer_fusion is None or layer_fusion == "" or layer_fusion == LAYER_FUSION_AUTO:
+            return LAYER_FUSION_WEIGHTED_SUM if len(self.encoder_layers) > 1 else LAYER_FUSION_SINGLE
+        if layer_fusion not in LAYER_FUSION_CHOICES:
+            raise ValueError(f"Unknown layer fusion: {layer_fusion}")
+        if layer_fusion == LAYER_FUSION_SINGLE and len(self.encoder_layers) != 1:
+            raise ValueError("single layer fusion requires exactly one encoder layer.")
+        if layer_fusion in (LAYER_FUSION_WEIGHTED_SUM, LAYER_FUSION_DYNAMIC_WEIGHTED_SUM):
+            if len(self.encoder_layers) < 2:
+                raise ValueError(f"{layer_fusion} requires at least two encoder layers.")
+        return layer_fusion
 
     def _resolve_encoder_layers(self, encoder_layer: int, encoder_layers: str | list[int] | None) -> list[int]:
         max_layers = self.encoder.config.encoder_layers
@@ -163,12 +197,12 @@ class WhisperWBDClassifier(nn.Module):
         return sorted(set(layers))
 
     @staticmethod
-    def _causal_attention_mask(hidden_states: torch.Tensor) -> torch.Tensor:
+    def _causal_attention_mask(hidden_states: torch.Tensor, lookahead_frames: int = 0) -> torch.Tensor:
         seq_len = hidden_states.size(1)
         mask = torch.zeros((1, 1, seq_len, seq_len), device=hidden_states.device, dtype=hidden_states.dtype)
         future_positions = torch.triu(
             torch.ones((seq_len, seq_len), device=hidden_states.device, dtype=torch.bool),
-            diagonal=1,
+            diagonal=1 + lookahead_frames,
         )
         return mask.masked_fill(future_positions.view(1, 1, seq_len, seq_len), torch.finfo(hidden_states.dtype).min)
 
@@ -200,7 +234,11 @@ class WhisperWBDClassifier(nn.Module):
         if max_selected_layer == 0:
             return [selected_hidden_states[layer] for layer in self.encoder_layers]
 
-        attention_mask = self._causal_attention_mask(hidden_states) if self.causal_encoder else None
+        attention_mask = (
+            self._causal_attention_mask(hidden_states, self.encoder_lookahead_frames)
+            if self.causal_encoder
+            else None
+        )
 
         # Layer N means the state after blocks 0..N-1, matching HF hidden_states[N].
         for idx, encoder_layer in enumerate(self.encoder.layers):
@@ -224,14 +262,21 @@ class WhisperWBDClassifier(nn.Module):
     def _fuse_selected_layers(self, hidden_states: list[torch.Tensor]) -> torch.Tensor:
         if self.layer_fusion == LAYER_FUSION_SINGLE:
             return hidden_states[0]
-        weights = torch.softmax(self.layer_fusion_logits, dim=0).to(
-            device=hidden_states[0].device,
-            dtype=hidden_states[0].dtype,
-        )
-        fused = hidden_states[0] * weights[0]
-        for weight, hidden in zip(weights[1:], hidden_states[1:]):
-            fused = fused + hidden * weight
-        return fused
+        if self.layer_fusion == LAYER_FUSION_WEIGHTED_SUM:
+            weights = torch.softmax(self.layer_fusion_logits, dim=0).to(
+                device=hidden_states[0].device,
+                dtype=hidden_states[0].dtype,
+            )
+            fused = hidden_states[0] * weights[0]
+            for weight, hidden in zip(weights[1:], hidden_states[1:]):
+                fused = fused + hidden * weight
+            return fused
+        if self.layer_fusion == LAYER_FUSION_DYNAMIC_WEIGHTED_SUM:
+            gate_input = hidden_states[-1]
+            weights = torch.softmax(self.layer_fusion_gate(gate_input), dim=-1).to(dtype=hidden_states[0].dtype)
+            stacked_hidden = torch.stack(hidden_states, dim=2)
+            return (stacked_hidden * weights.unsqueeze(-1)).sum(dim=2)
+        raise ValueError(f"Unknown layer fusion: {self.layer_fusion}")
 
     def forward(self, input_features: torch.Tensor) -> torch.Tensor:
         if self.freeze_encoder:
