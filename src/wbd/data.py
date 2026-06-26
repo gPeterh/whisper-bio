@@ -98,6 +98,7 @@ def iter_arrow_raw_examples(
             for idx in range(batch.num_rows):
                 if max_rows_per_shard is not None and row_count >= max_rows_per_shard:
                     return
+                source_index = row_count
                 row_count += 1
                 labels = labels_column[idx].as_py()
                 if labels is None:
@@ -107,6 +108,8 @@ def iter_arrow_raw_examples(
                 if label_len <= 0:
                     continue
                 yield {
+                    "source_file": path,
+                    "source_index": source_index,
                     "key": key_column[idx].as_py() if key_column is not None else "",
                     "mp3": mp3_column[idx].as_py(),
                     "labels": labels,
@@ -125,6 +128,8 @@ class WaltzArrowWBDDataset(IterableDataset):
         shuffle_buffer: int,
         seed: int,
         shuffle_files: bool,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         super().__init__()
         self.files = files
@@ -135,6 +140,8 @@ class WaltzArrowWBDDataset(IterableDataset):
         self.shuffle_buffer = shuffle_buffer
         self.seed = seed
         self.shuffle_files = shuffle_files
+        self.rank = rank
+        self.world_size = world_size
         self.epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
@@ -143,14 +150,16 @@ class WaltzArrowWBDDataset(IterableDataset):
     def _worker_files(self) -> list[str]:
         files = self.files[:]
         worker = get_worker_info()
-        if worker is not None:
-            files = files[worker.id :: worker.num_workers]
-            seed = self.seed + self.epoch * 100_003 + worker.id
-        else:
-            seed = self.seed + self.epoch * 100_003
+        seed = self.seed + self.epoch * 100_003
         if self.shuffle_files:
             random.Random(seed).shuffle(files)
-        return files
+        if worker is not None:
+            global_worker_id = self.rank * worker.num_workers + worker.id
+            global_num_workers = self.world_size * worker.num_workers
+        else:
+            global_worker_id = self.rank
+            global_num_workers = self.world_size
+        return files[global_worker_id::global_num_workers]
 
     def _iter_raw_examples(self) -> Iterable[dict]:
         for path in self._worker_files():
@@ -163,7 +172,9 @@ class WaltzArrowWBDDataset(IterableDataset):
             )
 
     def _shuffle_raw_examples(self, raw_examples: Iterable[dict]) -> Iterable[dict]:
-        rng = random.Random(self.seed + self.epoch * 100_003)
+        worker = get_worker_info()
+        worker_id = worker.id if worker is not None else 0
+        rng = random.Random(self.seed + self.epoch * 100_003 + self.rank * 1_009 + worker_id)
         buffer = []
         for example in raw_examples:
             if len(buffer) < self.shuffle_buffer:
@@ -189,6 +200,8 @@ class WaltzArrowWBDDataset(IterableDataset):
             labels = F.pad(labels, (0, self.max_tokens - labels.numel()), value=IGNORE_ID)
         labels[label_len:] = IGNORE_ID
         return {
+            "source_file": raw.get("source_file", ""),
+            "source_index": int(raw.get("source_index", -1)),
             "key": raw.get("key", ""),
             "waveform": waveform,
             "sample_rate": sample_rate,
@@ -223,10 +236,14 @@ class WhisperCollator:
         )
         labels = torch.stack([ex["labels"][: self.max_tokens] for ex in examples], dim=0)
         label_lens = torch.tensor([ex["label_len"] for ex in examples], dtype=torch.long)
+        source_files = [ex["source_file"] for ex in examples]
+        source_indices = torch.tensor([ex["source_index"] for ex in examples], dtype=torch.long)
         keys = [ex["key"] for ex in examples]
         return {
             "input_features": inputs.input_features,
             "labels": labels,
             "label_lens": label_lens,
+            "source_files": source_files,
+            "source_indices": source_indices,
             "keys": keys,
         }

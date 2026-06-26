@@ -6,6 +6,7 @@ import argparse
 import math
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -14,11 +15,36 @@ from .config import IGNORE_ID
 from .loss import flatten_for_loss
 from .metrics import BatchMetrics, paper_segmentation_metrics, token_boundary_metrics
 
+REDUCED_METRIC_FIELDS = (
+    "loss",
+    "len",
+    "token_acc",
+    "boundary_hits",
+    "boundary_pred",
+    "boundary_ref",
+)
+
 
 def autocast_context(args: argparse.Namespace, device: torch.device):
     enabled = args.amp and device.type == "cuda"
     dtype = torch.float16 if args.amp_dtype == "float16" else torch.bfloat16
     return torch.autocast(device_type="cuda", dtype=dtype, enabled=enabled)
+
+
+def distributed_enabled() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def reduce_epoch_totals(totals: BatchMetrics, count: int, device: torch.device) -> tuple[BatchMetrics, int]:
+    if not distributed_enabled():
+        return totals, count
+    values = [float(getattr(totals, field)) for field in REDUCED_METRIC_FIELDS]
+    values.append(float(count))
+    tensor = torch.tensor(values, dtype=torch.float64, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    for idx, field in enumerate(REDUCED_METRIC_FIELDS):
+        setattr(totals, field, float(tensor[idx].item()))
+    return totals, int(tensor[-1].item())
 
 
 def run_epoch(
@@ -34,6 +60,7 @@ def run_epoch(
     global_step: int,
     wandb_run=None,
     step_callback=None,
+    is_main_process: bool = True,
 ) -> tuple[BatchMetrics, int]:
     training = optimizer is not None
     model.train(training)
@@ -42,12 +69,21 @@ def run_epoch(
 
     iterator = iter(loader)
     max_steps = steps if steps > 0 else None
-    pbar = tqdm(total=max_steps, desc=desc, dynamic_ncols=True)
+    pbar = tqdm(total=max_steps, desc=desc, dynamic_ncols=True, disable=not is_main_process)
     step = 0
     while max_steps is None or step < max_steps:
+        batch = None
+        has_batch = 1
         try:
             batch = next(iterator)
         except StopIteration:
+            has_batch = 0
+        if distributed_enabled():
+            has_batch_tensor = torch.tensor([has_batch], dtype=torch.int32, device=device)
+            dist.all_reduce(has_batch_tensor, op=dist.ReduceOp.MIN)
+            if int(has_batch_tensor.item()) == 0:
+                break
+        elif not has_batch:
             break
 
         input_features = batch["input_features"].to(device, non_blocking=True)
@@ -112,7 +148,7 @@ def run_epoch(
         totals.segmentation_r_value += batch_metrics.segmentation_r_value
         count += 1
 
-        if step == 0 or (args.log_every > 0 and (step + 1) % args.log_every == 0):
+        if is_main_process and (step == 0 or (args.log_every > 0 and (step + 1) % args.log_every == 0)):
             postfix = {
                 "loss": f"{totals.loss / count:.4f}",
                 "tok_acc": f"{totals.token_acc / count:.3f}",
@@ -141,10 +177,12 @@ def run_epoch(
                     "train/len": batch_metrics.len,
                 }
                 wandb.log(log_values)
-        pbar.update(1)
+        if is_main_process:
+            pbar.update(1)
         step += 1
 
-    pbar.close()
+    if is_main_process:
+        pbar.close()
 
     if training and count > 0 and count % args.grad_accum_steps != 0:
         grad_norm = None
@@ -158,6 +196,7 @@ def run_epoch(
 
     if count == 0:
         return totals, global_step
+    totals, count = reduce_epoch_totals(totals, count, device)
     for field in ("loss", "len", "token_acc"):
         setattr(totals, field, getattr(totals, field) / count)
     precision, recall, f_value, os_value, r_value = paper_segmentation_metrics(
