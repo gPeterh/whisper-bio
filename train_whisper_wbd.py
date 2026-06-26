@@ -13,19 +13,22 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 
 from wbd.checkpoint import append_metrics, save_checkpoint
 from wbd.config import MAX_WHISPER_TOKENS
 from wbd.data import WhisperCollator, WaltzArrowWBDDataset, resolve_files
 from wbd.loss import make_criterion
-from wbd.model import WhisperWBDClassifier, ensure_transformers_torch_backend
+from wbd.model import LAYER_FUSION_CHOICES, WhisperWBDClassifier, ensure_transformers_torch_backend
 from wbd.trainer import autocast_context, run_epoch
 from wbd.wandb_utils import init_wandb
 
@@ -67,12 +70,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Comma-separated hidden-state indices. Multiple layers automatically use learnable weighted sum; use 'all' for all encoder layers.",
     )
+    parser.add_argument(
+        "--layer-fusion",
+        choices=LAYER_FUSION_CHOICES,
+        default="auto",
+        help="How to fuse multiple encoder layers. auto keeps the legacy single/global weighted-sum behavior.",
+    )
     parser.add_argument("--attn-implementation", default="sdpa", choices=[None, "eager", "sdpa", "flash_attention_2"])
     parser.add_argument(
         "--causal-encoder",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Apply a causal self-attention mask inside the Whisper encoder layers.",
+    )
+    parser.add_argument(
+        "--encoder-lookahead-frames",
+        type=int,
+        default=0,
+        help="Allow each encoder frame to attend to this many future frames when --causal-encoder is enabled.",
     )
     parser.add_argument("--freeze-encoder", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -87,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-len-col", default="wbd_label_len")
     parser.add_argument("--max-tokens", type=int, default=MAX_WHISPER_TOKENS)
 
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=2, help="Per-GPU batch size.")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor when --num-workers > 0.")
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=None)
@@ -130,10 +145,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-entity", default="ckip-Waltz")
     parser.add_argument("--wandb-project", default="whisper-WBD")
     parser.add_argument("--wandb-name", default=None)
+    parser.add_argument("--wandb-id", default=None, help="Existing W&B run id to resume into.")
+    parser.add_argument(
+        "--wandb-resume",
+        choices=["allow", "must", "never", "auto"],
+        default=None,
+        help="W&B resume mode used with --wandb-id.",
+    )
     parser.add_argument("--wandb-tags", nargs="*", default=None)
     parser.add_argument("--wandb-mode", default=None, choices=[None, "online", "offline", "disabled"])
     parser.add_argument("--smoke-test", action="store_true", help="Run one batch through the model, then exit.")
     return parser.parse_args()
+
+
+@dataclass(frozen=True)
+class DistributedState:
+    enabled: bool
+    rank: int
+    local_rank: int
+    world_size: int
+
+    @property
+    def is_main_process(self) -> bool:
+        return self.rank == 0
+
+
+def setup_distributed(args: argparse.Namespace) -> tuple[torch.device, DistributedState]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return torch.device(args.device), DistributedState(False, 0, 0, 1)
+    if not torch.cuda.is_available():
+        raise ValueError("DDP training requires CUDA.")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    return torch.device("cuda", local_rank), DistributedState(True, rank, local_rank, world_size)
+
+
+def cleanup_distributed(dist_state: DistributedState) -> None:
+    if dist_state.enabled:
+        dist.destroy_process_group()
+
+
+def log_main(dist_state: DistributedState, message: str) -> None:
+    if dist_state.is_main_process:
+        print(message)
+
+
+def global_batch_size(args: argparse.Namespace, dist_state: DistributedState) -> int:
+    return args.batch_size * dist_state.world_size
 
 
 def make_loader(
@@ -146,6 +207,9 @@ def make_loader(
     shuffle_files: bool,
     shuffle_buffer: int,
     seed: int,
+    rank: int,
+    world_size: int,
+    batch_size: int,
 ) -> tuple[WaltzArrowWBDDataset, DataLoader]:
     dataset = WaltzArrowWBDDataset(
         files=files,
@@ -156,9 +220,11 @@ def make_loader(
         shuffle_buffer=shuffle_buffer,
         seed=seed,
         shuffle_files=shuffle_files,
+        rank=rank,
+        world_size=world_size,
     )
     loader_kwargs = {
-        "batch_size": args.batch_size,
+        "batch_size": batch_size,
         "num_workers": args.num_workers,
         "pin_memory": device.type == "cuda" if args.pin_memory is None else args.pin_memory,
         "collate_fn": collator,
@@ -171,36 +237,75 @@ def make_loader(
 
 def main() -> None:
     args = parse_args()
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    device, dist_state = setup_distributed(args)
+    args.distributed = dist_state.enabled
+    args.world_size = dist_state.world_size
+    args.rank = dist_state.rank
+    args.local_rank = dist_state.local_rank
+    effective_global_batch_size = global_batch_size(args, dist_state)
+
+    random.seed(args.seed + dist_state.rank)
+    torch.manual_seed(args.seed + dist_state.rank)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     ensure_transformers_torch_backend()
 
     train_files, val_files = resolve_files(args)
     checkpoint_dir = Path(args.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    with open(checkpoint_dir / "run_args.json", "w", encoding="utf-8") as f:
-        json.dump(vars(args), f, indent=2, sort_keys=True)
-    with open(checkpoint_dir / "train_files.txt", "w", encoding="utf-8") as f:
-        f.write("\n".join(train_files) + "\n")
-    if val_files:
-        with open(checkpoint_dir / "val_files.txt", "w", encoding="utf-8") as f:
-            f.write("\n".join(val_files) + "\n")
 
-    print(f"train shards: {len(train_files)}")
-    print(f"val shards: {len(val_files)}")
-    print(f"label column: {args.label_col}")
+    # Auto-load W&B run ID if resuming and no explicit id was provided
+    if args.use_wandb and not args.wandb_id and args.resume:
+        wandb_id_path = checkpoint_dir / "wandb_id.txt"
+        if wandb_id_path.exists():
+            try:
+                with open(wandb_id_path, "r", encoding="utf-8") as f:
+                    args.wandb_id = f.read().strip()
+                if args.wandb_resume is None:
+                    args.wandb_resume = "allow"
+                log_main(dist_state, f"Auto-loaded W&B run ID '{args.wandb_id}' from {wandb_id_path}")
+            except Exception as e:
+                log_main(dist_state, f"Warning: Failed to read wandb_id.txt: {e}")
+
+    if dist_state.is_main_process:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        with open(checkpoint_dir / "run_args.json", "w", encoding="utf-8") as f:
+            json.dump(vars(args), f, indent=2, sort_keys=True)
+        with open(checkpoint_dir / "train_files.txt", "w", encoding="utf-8") as f:
+            f.write("\n".join(train_files) + "\n")
+        if val_files:
+            with open(checkpoint_dir / "val_files.txt", "w", encoding="utf-8") as f:
+                f.write("\n".join(val_files) + "\n")
+    if dist_state.enabled:
+        dist.barrier()
+
+    log_main(dist_state, f"distributed: {dist_state.enabled} world_size={dist_state.world_size}")
+    log_main(dist_state, f"device: {device}")
+    log_main(
+        dist_state,
+        f"batch_size: per_gpu={args.batch_size} global={effective_global_batch_size}",
+    )
+    log_main(dist_state, f"train shards: {len(train_files)}")
+    log_main(dist_state, f"val shards: {len(val_files)}")
+    log_main(dist_state, f"label column: {args.label_col}")
     if args.encoder_layers:
-        print(
+        log_main(
+            dist_state,
             f"model: {args.model_name_or_path}, encoder hidden layers: {args.encoder_layers}, "
-            "layer_fusion: auto"
+            f"layer_fusion: {args.layer_fusion}",
         )
     else:
-        print(f"model: {args.model_name_or_path}, encoder hidden layer: {args.encoder_layer}")
-    wandb_run = init_wandb(args, train_files, val_files)
+        log_main(dist_state, f"model: {args.model_name_or_path}, encoder hidden layer: {args.encoder_layer}")
+    wandb_run = init_wandb(args, train_files, val_files) if dist_state.is_main_process else None
 
-    device = torch.device(args.device)
+    if dist_state.is_main_process and wandb_run is not None:
+        wandb_id_path = checkpoint_dir / "wandb_id.txt"
+        try:
+            with open(wandb_id_path, "w", encoding="utf-8") as f:
+                f.write(wandb_run.id)
+            log_main(dist_state, f"Saved W&B run ID '{wandb_run.id}' to {wandb_id_path}")
+        except Exception as e:
+            print(f"Warning: Failed to save W&B run ID to file: {e}")
+
     collator = WhisperCollator(args.model_name_or_path, args.max_tokens)
     train_dataset, train_loader = make_loader(
         files=train_files,
@@ -211,6 +316,9 @@ def main() -> None:
         shuffle_files=True,
         shuffle_buffer=args.shuffle_buffer,
         seed=args.seed,
+        rank=dist_state.rank,
+        world_size=dist_state.world_size,
+        batch_size=args.batch_size,
     )
 
     val_dataset = None
@@ -225,6 +333,9 @@ def main() -> None:
             shuffle_files=False,
             shuffle_buffer=0,
             seed=args.seed + 999,
+            rank=dist_state.rank,
+            world_size=dist_state.world_size,
+            batch_size=args.batch_size,
         )
 
     model = WhisperWBDClassifier(
@@ -235,23 +346,19 @@ def main() -> None:
         dropout=args.dropout,
         attn_implementation=args.attn_implementation,
         causal_encoder=args.causal_encoder,
+        encoder_lookahead_frames=args.encoder_lookahead_frames,
         encoder_layers=args.encoder_layers,
+        layer_fusion=args.layer_fusion,
     ).to(device)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    print(f"parameters: trainable={trainable:,} total={total:,}")
-
-    criterion = make_criterion(args, device)
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    log_main(dist_state, f"parameters: trainable={trainable:,} total={total:,}")
 
     start_epoch = 1
     global_step = 0
     best_score = -math.inf
+    ckpt = None
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu")
         if "model" in ckpt:
@@ -268,21 +375,38 @@ def main() -> None:
             model.classifier.load_state_dict(ckpt["classifier"])
         else:
             raise ValueError(f"Checkpoint {args.resume} does not contain model or classifier weights.")
-        optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         global_step = int(ckpt.get("global_step", 0))
         best_score = float(ckpt.get("best_segmentation_r_value"))
-        print(f"resumed from {args.resume} at epoch {start_epoch}")
+        log_main(dist_state, f"resumed from {args.resume} at epoch {start_epoch}")
+
+    if dist_state.enabled:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[dist_state.local_rank],
+            output_device=dist_state.local_rank,
+            find_unused_parameters=not args.freeze_encoder,
+        )
+
+    criterion = make_criterion(args, device)
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+    if ckpt is not None:
+        optimizer.load_state_dict(ckpt["optimizer"])
 
     if args.smoke_test:
         batch = next(iter(train_loader))
         model.eval()
         with torch.no_grad(), autocast_context(args, device):
             logits = model(batch["input_features"].to(device))
-        print(f"smoke input_features: {tuple(batch['input_features'].shape)}")
-        print(f"smoke labels: {tuple(batch['labels'].shape)}")
-        print(f"smoke logits: {tuple(logits.shape)}")
-        print(f"smoke label_lens: {batch['label_lens'].tolist()}")
+        log_main(dist_state, f"smoke input_features: {tuple(batch['input_features'].shape)}")
+        log_main(dist_state, f"smoke labels: {tuple(batch['labels'].shape)}")
+        log_main(dist_state, f"smoke logits: {tuple(logits.shape)}")
+        log_main(dist_state, f"smoke label_lens: {batch['label_lens'].tolist()}")
+        cleanup_distributed(dist_state)
         return
 
     metrics_path = checkpoint_dir / "metrics.csv"
@@ -312,39 +436,29 @@ def main() -> None:
             epoch=epoch,
             global_step=global_step,
             wandb_run=None,
+            is_main_process=dist_state.is_main_process,
         )
-        append_metrics(metrics_path, epoch, metrics_split, val_metrics)
-        print(f"{metrics_split}: {asdict(val_metrics)}")
-        if wandb_run is not None:
-            wandb_run.log(
-                {
-                    "global_step": global_step,
-                    "val/epoch": epoch,
-                    "val/loss": val_metrics.loss,
-                    "val/len": val_metrics.len,
-                    "val/token_acc": val_metrics.token_acc,
-                    "val/segmentation_precision": val_metrics.segmentation_precision,
-                    "val/segmentation_recall": val_metrics.segmentation_recall,
-                    "val/segmentation_f_value": val_metrics.segmentation_f_value,
-                    "val/segmentation_os": val_metrics.segmentation_os,
-                    "val/segmentation_r_value": val_metrics.segmentation_r_value,
-                }
-            )
+        if dist_state.is_main_process:
+            append_metrics(metrics_path, epoch, metrics_split, val_metrics)
+            print(f"{metrics_split}: {asdict(val_metrics)}")
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "global_step": global_step,
+                        "val/epoch": epoch,
+                        "val/loss": val_metrics.loss,
+                        "val/len": val_metrics.len,
+                        "val/token_acc": val_metrics.token_acc,
+                        "val/segmentation_precision": val_metrics.segmentation_precision,
+                        "val/segmentation_recall": val_metrics.segmentation_recall,
+                        "val/segmentation_f_value": val_metrics.segmentation_f_value,
+                        "val/segmentation_os": val_metrics.segmentation_os,
+                        "val/segmentation_r_value": val_metrics.segmentation_r_value,
+                    }
+                )
 
-        save_checkpoint(
-            checkpoint_dir / checkpoint_name,
-            model,
-            optimizer,
-            args,
-            checkpoint_epoch,
-            global_step,
-            best_state["score"],
-            train_files,
-            val_files,
-        )
-        if resume_checkpoint_name is not None:
             save_checkpoint(
-                checkpoint_dir / resume_checkpoint_name,
+                checkpoint_dir / checkpoint_name,
                 model,
                 optimizer,
                 args,
@@ -354,22 +468,37 @@ def main() -> None:
                 train_files,
                 val_files,
             )
+            if resume_checkpoint_name is not None:
+                save_checkpoint(
+                    checkpoint_dir / resume_checkpoint_name,
+                    model,
+                    optimizer,
+                    args,
+                    checkpoint_epoch,
+                    global_step,
+                    best_state["score"],
+                    train_files,
+                    val_files,
+                )
 
         score = val_metrics.segmentation_r_value
         if score > best_state["score"]:
             best_state["score"] = score
-            save_checkpoint(
-                checkpoint_dir / "best.pt",
-                model,
-                optimizer,
-                args,
-                checkpoint_epoch,
-                global_step,
-                best_state["score"],
-                train_files,
-                val_files,
-            )
-            print(f"saved best.pt with segmentation_r_value={best_state['score']:.4f}")
+            if dist_state.is_main_process:
+                save_checkpoint(
+                    checkpoint_dir / "best.pt",
+                    model,
+                    optimizer,
+                    args,
+                    checkpoint_epoch,
+                    global_step,
+                    best_state["score"],
+                    train_files,
+                    val_files,
+                )
+                print(f"saved best.pt with segmentation_r_value={best_state['score']:.4f}")
+        if dist_state.enabled:
+            dist.barrier()
 
     def maybe_validate_on_step(epoch: int, current_global_step: int) -> None:
         if args.val_every_steps <= 0:
@@ -401,9 +530,11 @@ def main() -> None:
             global_step=global_step,
             wandb_run=wandb_run,
             step_callback=maybe_validate_on_step,
+            is_main_process=dist_state.is_main_process,
         )
-        append_metrics(metrics_path, epoch, "train", train_metrics)
-        print(f"epoch {epoch} train: {asdict(train_metrics)}")
+        if dist_state.is_main_process:
+            append_metrics(metrics_path, epoch, "train", train_metrics)
+            print(f"epoch {epoch} train: {asdict(train_metrics)}")
 
         run_validation_and_checkpoint(
             epoch=epoch,
@@ -414,10 +545,11 @@ def main() -> None:
             resume_checkpoint_name=f"epoch_{epoch - 1}_whole_resume.pt",
         )
 
-        print(f"epoch {epoch} done in {(time.time() - start) / 60:.1f} min")
+        log_main(dist_state, f"epoch {epoch} done in {(time.time() - start) / 60:.1f} min")
 
     if wandb_run is not None:
         wandb_run.finish()
+    cleanup_distributed(dist_state)
 
 
 if __name__ == "__main__":
