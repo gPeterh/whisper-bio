@@ -25,6 +25,36 @@ class BatchMetrics:
     segmentation_r_value: float = 0.0
 
 
+def repair_bio_sequence(sequence: torch.Tensor) -> torch.Tensor:
+    repaired = sequence.clone()
+    prev = 0
+    for idx in range(repaired.numel()):
+        label = int(repaired[idx].item())
+        if label == 2 and prev == 0:
+            repaired[idx] = 1
+            label = 1
+        prev = label
+    return repaired
+
+
+def repair_bio_predictions(pred: torch.Tensor, label_lens: torch.Tensor | None = None) -> torch.Tensor:
+    repaired = pred.clone()
+    if repaired.dim() == 1:
+        length = repaired.numel() if label_lens is None else min(int(label_lens.item()), repaired.numel())
+        repaired[:length] = repair_bio_sequence(repaired[:length])
+        return repaired
+
+    if repaired.dim() != 2:
+        raise ValueError(f"BIO prediction repair expects a 1D or 2D tensor, got shape={tuple(repaired.shape)}")
+
+    for batch_index in range(repaired.size(0)):
+        length = repaired.size(1)
+        if label_lens is not None:
+            length = min(int(label_lens[batch_index].item()), length)
+        repaired[batch_index, :length] = repair_bio_sequence(repaired[batch_index, :length])
+    return repaired
+
+
 def select_frame_from_group(group: list[int], frame_selection: str) -> list[int]:
     if frame_selection == "none":
         return group
@@ -79,8 +109,19 @@ def token_boundary_metrics(
     frame_selection: str,
 ) -> BatchMetrics:
     pred = logits.argmax(dim=-1)
+    return prediction_boundary_metrics(pred, labels, label_lens, tolerance, frame_selection)
+
+
+def prediction_boundary_metrics(
+    pred: torch.Tensor,
+    labels: torch.Tensor,
+    label_lens: torch.Tensor,
+    tolerance: int,
+    frame_selection: str,
+) -> BatchMetrics:
     valid = labels != IGNORE_ID
     metrics = BatchMetrics()
+    metrics.len = int(valid.sum().item())
     if valid.any():
         metrics.token_acc = (pred[valid] == labels[valid]).float().mean().item()
 
