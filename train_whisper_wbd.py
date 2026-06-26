@@ -140,7 +140,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir", default="./checkpoint/whisper_wbd")
     parser.add_argument("--resume", default=None, help="Explicit checkpoint path to resume model/optimizer.")
     parser.add_argument("--log-every", type=int, default=500)
-    parser.add_argument("--save-full-model", action="store_true", help="Also store frozen Whisper encoder weights.")
     parser.add_argument("--use-wandb", action="store_true", help="Log training metrics to Weights & Biases.")
     parser.add_argument("--wandb-entity", default="ckip-Waltz")
     parser.add_argument("--wandb-project", default="whisper-WBD")

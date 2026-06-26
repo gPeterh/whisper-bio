@@ -46,8 +46,6 @@ def save_checkpoint(
         "layer_fusion": model_to_save.layer_fusion,
         "freeze_encoder": args.freeze_encoder,
     }
-    if args.save_full_model:
-        checkpoint["model"] = model_to_save.state_dict()
     torch.save(checkpoint, path)
 
 
