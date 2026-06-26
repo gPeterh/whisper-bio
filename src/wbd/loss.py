@@ -19,18 +19,23 @@ class FocalLoss(nn.Module):
         self.ignore_index = ignore_index
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        ce = F.cross_entropy(
-            logits,
-            target,
-            weight=self.weight,
-            ignore_index=self.ignore_index,
-            reduction="none",
-        )
         valid = target != self.ignore_index
         if not valid.any():
-            return ce.sum() * 0.0
-        pt = torch.exp(-ce[valid])
-        return ((1.0 - pt) ** self.gamma * ce[valid]).mean()
+            return logits.sum() * 0.0
+
+        valid_logits = logits[valid]
+        valid_target = target[valid]
+        ce = F.cross_entropy(
+            valid_logits,
+            valid_target,
+            reduction="none",
+        )
+        pt = torch.exp(-ce)
+        loss = (1.0 - pt) ** self.gamma * ce
+        if self.weight is not None:
+            alpha = self.weight.to(device=logits.device, dtype=loss.dtype)[valid_target]
+            loss = alpha * loss
+        return loss.mean()
 
 
 def parse_class_weights(value: str | None, device: torch.device) -> torch.Tensor | None:
