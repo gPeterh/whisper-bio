@@ -17,10 +17,7 @@ DYNAMIC_FUSION_HIDDEN_SIZE = 128
 LAYER_FUSION_SINGLE = "single"
 LAYER_FUSION_WEIGHTED_SUM = "learnable_weighted_sum"
 LAYER_FUSION_DYNAMIC_WEIGHTED_SUM = "dynamic_weighted_sum"
-LAYER_FUSION_AUTO = "auto"
 LAYER_FUSION_CHOICES = (
-    LAYER_FUSION_AUTO,
-    LAYER_FUSION_SINGLE,
     LAYER_FUSION_WEIGHTED_SUM,
     LAYER_FUSION_DYNAMIC_WEIGHTED_SUM,
 )
@@ -165,15 +162,15 @@ class WhisperWBDClassifier(nn.Module):
         self.classifier = make_bio_head(head_type, hidden_size, dropout)
 
     def _resolve_layer_fusion(self, layer_fusion: str | None) -> str:
-        if layer_fusion is None or layer_fusion == "" or layer_fusion == LAYER_FUSION_AUTO:
-            return LAYER_FUSION_WEIGHTED_SUM if len(self.encoder_layers) > 1 else LAYER_FUSION_SINGLE
+        if len(self.encoder_layers) == 1:
+            if layer_fusion in (None, "", LAYER_FUSION_SINGLE):
+                return LAYER_FUSION_SINGLE
+            raise ValueError("Single encoder-layer mode does not accept a layer fusion method.")
         if layer_fusion not in LAYER_FUSION_CHOICES:
-            raise ValueError(f"Unknown layer fusion: {layer_fusion}")
-        if layer_fusion == LAYER_FUSION_SINGLE and len(self.encoder_layers) != 1:
-            raise ValueError("single layer fusion requires exactly one encoder layer.")
-        if layer_fusion in (LAYER_FUSION_WEIGHTED_SUM, LAYER_FUSION_DYNAMIC_WEIGHTED_SUM):
-            if len(self.encoder_layers) < 2:
-                raise ValueError(f"{layer_fusion} requires at least two encoder layers.")
+            raise ValueError(
+                "Multi-layer encoder mode requires layer_fusion to be one of "
+                f"{', '.join(LAYER_FUSION_CHOICES)}."
+            )
         return layer_fusion
 
     def _resolve_encoder_layers(self, encoder_layer: int, encoder_layers: str | list[int] | None) -> list[int]:

@@ -28,7 +28,7 @@ from wbd.checkpoint import append_metrics, save_checkpoint
 from wbd.config import MAX_WHISPER_TOKENS
 from wbd.data import WhisperCollator, WaltzArrowWBDDataset, resolve_files
 from wbd.loss import make_criterion
-from wbd.model import LAYER_FUSION_CHOICES, WhisperWBDClassifier, ensure_transformers_torch_backend
+from wbd.model import LAYER_FUSION_CHOICES, LAYER_FUSION_SINGLE, WhisperWBDClassifier, ensure_transformers_torch_backend
 from wbd.trainer import autocast_context, run_epoch
 from wbd.wandb_utils import init_wandb
 
@@ -42,19 +42,16 @@ def parse_args() -> argparse.Namespace:
         default="/work/peter065/WALTZ_storage/waltz_datasets/train",
         help="Directory containing WALTZ .arrow shards.",
     )
-    parser.add_argument("--glob", default="*.arrow", help="Shard glob used with --train-dir.")
     parser.add_argument(
         "--val-dir",
         default="/work/peter065/WALTZ_storage/waltz_datasets/dev",
         help="Directory containing validation .arrow shards. Set empty to disable validation.",
     )
-    parser.add_argument("--val-glob", default="*.arrow", help="Shard glob used with --val-dir.")
     parser.add_argument("--train-files", nargs="*", default=None, help="Explicit train Arrow files.")
     parser.add_argument("--train-manifest", default=None, help="Text file with one train Arrow file per line.")
     parser.add_argument("--val-files", nargs="*", default=None, help="Explicit validation Arrow files.")
     parser.add_argument("--val-manifest", default=None, help="Text file with one validation Arrow file per line.")
     parser.add_argument("--limit-shards", type=int, default=None, help="Use only the first N train shards.")
-    parser.add_argument("--max-rows-per-shard", type=int, default=None, help="Debug limit per shard.")
     parser.add_argument("--shuffle-buffer", type=int, default=512, help="Streaming shuffle buffer size. 0 disables row shuffle.")
     parser.add_argument("--seed", type=int, default=1337)
 
@@ -68,13 +65,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--encoder-layers",
         default=None,
-        help="Comma-separated hidden-state indices. Multiple layers automatically use learnable weighted sum; use 'all' for all encoder layers.",
+        help="Comma-separated hidden-state indices for multi-layer fusion. Must resolve to at least two layers.",
     )
     parser.add_argument(
         "--layer-fusion",
         choices=LAYER_FUSION_CHOICES,
-        default="auto",
-        help="How to fuse multiple encoder layers. auto keeps the legacy single/global weighted-sum behavior.",
+        default=None,
+        help="Required with --encoder-layers. Choose how to fuse multiple encoder layers.",
     )
     parser.add_argument("--attn-implementation", default="sdpa", choices=[None, "eager", "sdpa", "flash_attention_2"])
     parser.add_argument(
@@ -107,7 +104,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor when --num-workers > 0.")
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--steps-per-epoch", type=int, default=0, help="Training batches per epoch. 0 means run through all resolved training shards.")
     parser.add_argument("--val-steps", type=int, default=0, help="Validation batches per epoch. 0 means run through all validation shards; negative disables validation.")
     parser.add_argument(
         "--val-every-steps",
@@ -145,16 +141,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-project", default="whisper-WBD")
     parser.add_argument("--wandb-name", default=None)
     parser.add_argument("--wandb-id", default=None, help="Existing W&B run id to resume into.")
-    parser.add_argument(
-        "--wandb-resume",
-        choices=["allow", "must", "never", "auto"],
-        default=None,
-        help="W&B resume mode used with --wandb-id.",
-    )
     parser.add_argument("--wandb-tags", nargs="*", default=None)
     parser.add_argument("--wandb-mode", default=None, choices=[None, "online", "offline", "disabled"])
     parser.add_argument("--smoke-test", action="store_true", help="Run one batch through the model, then exit.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    validate_layer_args(parser, args)
+    return args
+
+
+def encoder_layers_count(value: str) -> int:
+    spec = value.strip().lower()
+    if spec == "all":
+        return 32
+    return len({int(part.strip()) for part in value.split(",") if part.strip()})
+
+
+def validate_layer_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.encoder_layers:
+        try:
+            layer_count = encoder_layers_count(args.encoder_layers)
+        except ValueError as exc:
+            parser.error(f"--encoder-layers must be a comma-separated integer list or 'all': {exc}")
+        if layer_count < 2:
+            parser.error("--encoder-layers must contain at least two distinct layers.")
+        if args.layer_fusion is None:
+            parser.error("--layer-fusion is required when --encoder-layers is set.")
+        return
+    if args.layer_fusion is not None:
+        parser.error("--layer-fusion can only be used with --encoder-layers.")
+    args.layer_fusion = LAYER_FUSION_SINGLE
 
 
 @dataclass(frozen=True)
@@ -215,7 +230,6 @@ def make_loader(
         label_col=label_col,
         label_len_col=args.label_len_col,
         max_tokens=args.max_tokens,
-        max_rows_per_shard=args.max_rows_per_shard,
         shuffle_buffer=shuffle_buffer,
         seed=seed,
         shuffle_files=shuffle_files,
@@ -259,8 +273,6 @@ def main() -> None:
             try:
                 with open(wandb_id_path, "r", encoding="utf-8") as f:
                     args.wandb_id = f.read().strip()
-                if args.wandb_resume is None:
-                    args.wandb_resume = "allow"
                 log_main(dist_state, f"Auto-loaded W&B run ID '{args.wandb_id}' from {wandb_id_path}")
             except Exception as e:
                 log_main(dist_state, f"Warning: Failed to read wandb_id.txt: {e}")
@@ -523,7 +535,7 @@ def main() -> None:
             optimizer=optimizer,
             device=device,
             args=args,
-            steps=args.steps_per_epoch,
+            steps=0,
             desc=f"epoch {epoch} train",
             epoch=epoch,
             global_step=global_step,

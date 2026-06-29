@@ -20,6 +20,8 @@ from transformers import WhisperFeatureExtractor
 
 from .config import IGNORE_ID, MAX_AUDIO_SECONDS, SAMPLE_RATE
 
+ARROW_GLOB = "*.arrow"
+
 
 def read_manifest(path: str | None) -> list[str]:
     if not path:
@@ -34,7 +36,7 @@ def resolve_files(args) -> tuple[list[str], list[str]]:
         train_files.extend(args.train_files)
     train_files.extend(read_manifest(args.train_manifest))
     if not train_files:
-        train_files = sorted(str(p) for p in Path(args.train_dir).glob(args.glob))
+        train_files = sorted(str(p) for p in Path(args.train_dir).glob(ARROW_GLOB))
     if args.limit_shards is not None:
         train_files = train_files[: args.limit_shards]
 
@@ -43,7 +45,7 @@ def resolve_files(args) -> tuple[list[str], list[str]]:
         val_files.extend(args.val_files)
     val_files.extend(read_manifest(args.val_manifest))
     if not val_files and args.val_dir:
-        val_files = sorted(str(p) for p in Path(args.val_dir).glob(args.val_glob))
+        val_files = sorted(str(p) for p in Path(args.val_dir).glob(ARROW_GLOB))
         if not val_files:
             raise ValueError(f"No validation Arrow files resolved from --val-dir {args.val_dir!r}.")
 
@@ -82,7 +84,6 @@ def iter_arrow_raw_examples(
     label_col: str,
     label_len_col: str,
     max_tokens: int,
-    max_rows_per_shard: int | None,
 ) -> Iterable[dict]:
     with pa.memory_map(path, "r") as source:
         reader = ipc.open_stream(source)
@@ -96,8 +97,6 @@ def iter_arrow_raw_examples(
             labels_column = batch.column(column_names.index(label_col))
             label_len_column = batch.column(column_names.index(label_len_col))
             for idx in range(batch.num_rows):
-                if max_rows_per_shard is not None and row_count >= max_rows_per_shard:
-                    return
                 source_index = row_count
                 row_count += 1
                 labels = labels_column[idx].as_py()
@@ -124,7 +123,6 @@ class WaltzArrowWBDDataset(IterableDataset):
         label_col: str,
         label_len_col: str,
         max_tokens: int,
-        max_rows_per_shard: int | None,
         shuffle_buffer: int,
         seed: int,
         shuffle_files: bool,
@@ -136,7 +134,6 @@ class WaltzArrowWBDDataset(IterableDataset):
         self.label_col = label_col
         self.label_len_col = label_len_col
         self.max_tokens = max_tokens
-        self.max_rows_per_shard = max_rows_per_shard
         self.shuffle_buffer = shuffle_buffer
         self.seed = seed
         self.shuffle_files = shuffle_files
@@ -168,7 +165,6 @@ class WaltzArrowWBDDataset(IterableDataset):
                 label_col=self.label_col,
                 label_len_col=self.label_len_col,
                 max_tokens=self.max_tokens,
-                max_rows_per_shard=self.max_rows_per_shard,
             )
 
     def _shuffle_raw_examples(self, raw_examples: Iterable[dict]) -> Iterable[dict]:

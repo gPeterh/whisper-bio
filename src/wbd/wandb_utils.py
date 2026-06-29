@@ -27,7 +27,7 @@ def init_wandb(args: argparse.Namespace, train_files: list[str], val_files: list
         project=args.wandb_project,
         name=args.wandb_name,
         id=args.wandb_id,
-        resume=args.wandb_resume,
+        resume="allow" if args.wandb_id else None,
         tags=args.wandb_tags,
         mode=args.wandb_mode,
         config=config,
