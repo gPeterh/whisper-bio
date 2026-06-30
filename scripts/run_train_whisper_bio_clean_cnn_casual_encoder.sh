@@ -7,7 +7,7 @@
 #SBATCH --time=32-00:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=1
+#SBATCH --gpus-per-node=2
 #SBATCH --cpus-per-task=16
 #SBATCH -o /ceph/work/KLP/peter1/whisper-bio/whisper_bio_slurm/%j.out
 #SBATCH -e /ceph/work/KLP/peter1/whisper-bio/whisper_bio_slurm/%j.err
@@ -30,7 +30,7 @@ TRAIN_DIR="${TRAIN_DIR:-/ceph/work/KLP/peter1/WALTZ_storage/waltz_datasets/train
 VAL_DIR="${VAL_DIR:-/ceph/work/KLP/peter1/WALTZ_storage/waltz_datasets/dev}"
 LABEL_COL="${LABEL_COL:-wbd_labels}"
 CAUSAL_ENCODER="${CAUSAL_ENCODER:-1}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-/ceph/work/KLP/peter1/whisper-bio/checkpoints/whisper_bio_clean_cnn_causal_encoder}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-${PROJECT_ROOT}/checkpoints/whisper_bio_clean_cnn_causal_encoder}"
 RUN_NAME="${RUN_NAME:-whisper-bio-clean-cnn-causal_encoder}"
 
 BATCH_SIZE="${BATCH_SIZE:-32}"
@@ -40,7 +40,6 @@ PREFETCH_FACTOR="${PREFETCH_FACTOR:-6}"
 SHUFFLE_BUFFER="${SHUFFLE_BUFFER:-1000}"
 EPOCHS="${EPOCHS:-1}"
 VAL_EVERY_STEPS="${VAL_EVERY_STEPS:-8000}"
-STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-0}"
 VAL_STEPS="${VAL_STEPS:-0}"
 LR="${LR:-1e-3}"
 HEAD_TYPE="${HEAD_TYPE:-causal_conv1d}"
@@ -59,33 +58,10 @@ echo "label_col=${LABEL_COL}"
 echo "head_type=${HEAD_TYPE}"
 echo "causal_encoder=${CAUSAL_ENCODER}"
 echo "checkpoint_dir=${CHECKPOINT_DIR}"
-echo "steps_per_epoch=${STEPS_PER_EPOCH} val_steps=${VAL_STEPS} val_every_steps=${VAL_EVERY_STEPS}"
+echo "val_steps=${VAL_STEPS} val_every_steps=${VAL_EVERY_STEPS}"
 echo "batch_size=${BATCH_SIZE}"
 echo "num_workers=${NUM_WORKERS} prefetch_factor=${PREFETCH_FACTOR} shuffle_buffer=${SHUFFLE_BUFFER}"
 echo "OMP_NUM_THREADS=${OMP_NUM_THREADS} MKL_NUM_THREADS=${MKL_NUM_THREADS}"
-
-
-python - <<'PY'
-import importlib.util
-import os
-import sys
-
-required = ["torch", "pyarrow", "scipy", "soundfile", "transformers"]
-if os.environ.get("USE_WANDB", "1") == "1":
-    required.append("wandb")
-missing = [name for name in required if importlib.util.find_spec(name) is None]
-if missing:
-    sys.exit("Missing Python packages: " + ", ".join(missing) + ". Run: uv sync --no-default-groups")
-
-import torch
-
-version_parts = tuple(int(part) for part in torch.__version__.split("+")[0].split(".")[:2])
-if version_parts < (2, 1):
-    sys.exit(
-        f"PyTorch {torch.__version__} is too old for the installed Transformers. "
-        "Run: pip install --upgrade -r requirements.txt"
-    )
-PY
 
 
 
@@ -98,7 +74,20 @@ if [[ "${USE_WANDB:-1}" == "1" ]]; then
   )
 fi
 
-python -u "${PROJECT_ROOT}/train_whisper_wbd.py" \
+NUM_GPUS="${NUM_GPUS:-$(python - <<'PY'
+import torch
+
+print(torch.cuda.device_count())
+PY
+)}"
+if (( NUM_GPUS < 1 )); then
+  echo "No visible CUDA GPUs." >&2
+  exit 1
+fi
+echo "num_gpus=${NUM_GPUS}"
+
+torchrun --standalone --nnodes=1 --nproc_per_node "${NUM_GPUS}" \
+  "${PROJECT_ROOT}/train_whisper_wbd.py" \
   --train-dir "${TRAIN_DIR}" \
   --val-dir "${VAL_DIR}" \
   --label-col "${LABEL_COL}" \

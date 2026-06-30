@@ -33,7 +33,6 @@ ENCODER_LAYERS="${ENCODER_LAYERS:-8,16,24,32}"
 LAYER_FUSION="${LAYER_FUSION:-dynamic_weighted_sum}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${PROJECT_ROOT}/checkpoints/whisper_bio_clean_cnn_causal_encoder_LA5_DynamicLayerFusion_focal}"
 RUN_NAME="${RUN_NAME:-whisper_bio_clean_cnn_causal_encoder_LA5_DynamicLayerFusion_focal}"
-
 BATCH_SIZE="${BATCH_SIZE:-32}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
