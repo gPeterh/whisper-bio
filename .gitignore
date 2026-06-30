@@ -9,6 +9,12 @@ experiments/wandb/
 uv_venv_slurm/
 checkpoint/
 checkpoints/
+infer_result/
+label_count_result/
+slurm-logs/
+whisper_bio_slurm/
+debug_infer_output/
+dump/
 dist/
 build/
 *.egg-info/
